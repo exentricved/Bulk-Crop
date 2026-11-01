@@ -24,6 +24,12 @@ Reopen the same folder at any time to pick up where you left off. Progress is sa
 
 If Windows SmartScreen warns about an unrecognised app, click **More info → Run anyway**.
 
+### Updating
+
+When a newer release is out, an **⬆ Update to vX** button appears at the top of the window. Click it to
+download and install the new version, then restart. Any background encoding keeps going on the old version until
+it finishes. (Updating from v1.1.0 or earlier is a one-time manual download.)
+
 ## Running from source
 
 Requires Python 3 and ffmpeg/ffprobe on PATH (`winget install Gyan.FFmpeg`).
@@ -44,3 +50,6 @@ pyinstaller --onefile --windowed --name BulkCrop bulk_crop.py
 ```
 
 Put `ffmpeg.exe` and `ffprobe.exe` next to `BulkCrop.exe`; they are used ahead of any on PATH.
+
+To release: bump `VERSION` in `bulk_crop.py`, tag it `vX.Y.Z`, and attach `BulkCrop.exe` (the in-app updater
+downloads this asset) and `BulkCrop-windows.zip` to a GitHub release with that tag.

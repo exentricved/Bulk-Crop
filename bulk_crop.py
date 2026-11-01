@@ -15,6 +15,9 @@ Bulk Crop - set crops for many videos in one sitting, encode them in the backgro
 Progress lives in <output>/_bulk_crop_state.json, so you can close and reopen
 on the same folder at any time and pick up where you left off.
 
+Updates: when a newer release is on GitHub, an "Update" button appears at the top
+of the window; it downloads the new version in place and restarts.
+
 Usage:
   pythonw bulk_crop.py                       choose folders with dialogs
   pythonw bulk_crop.py INPUT [-o OUTPUT]     skip the folder dialogs
@@ -34,9 +37,12 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+VERSION = "1.2.0"
+REPO = "exentricved/Bulk-Crop"
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".mpg", ".mpeg",
               ".webm", ".flv", ".mts", ".m2ts", ".ts", ".3gp"}
 STATE_NAME = "_bulk_crop_state.json"
@@ -311,6 +317,94 @@ def launch_background(state):
                      creationflags=flags, close_fds=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=os.name != "nt")
+
+
+# ---------------------------------------------------------------------------
+# updates from the GitHub releases page
+
+def version_tuple(tag):
+    return tuple(int(n) for n in tag.lstrip("vV").split(".") if n.isdigit())
+
+
+def update_target():
+    """The file an update replaces: the running exe, or this script when run from source."""
+    return Path(sys.executable).resolve() if FROZEN else Path(__file__).resolve()
+
+
+def sibling(path, tag):
+    return path.with_name(f"{path.stem}.{tag}{path.suffix}")
+
+
+def check_for_update():
+    """(tag, download url, release notes) when a newer release is out, else None."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "User-Agent": f"BulkCrop/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        rel = json.load(r)
+    tag = rel.get("tag_name", "")
+    if version_tuple(tag) <= version_tuple(VERSION):
+        return None
+    if FROZEN:
+        url = next((a["browser_download_url"] for a in rel.get("assets", []) if a["name"] == "BulkCrop.exe"), None)
+        if not url:
+            return None
+    else:
+        url = f"https://raw.githubusercontent.com/{REPO}/{tag}/bulk_crop.py"
+    return tag, url, (rel.get("body") or "").strip()
+
+
+def install_update(url):
+    """Download the new version next to the old one, check it, then swap it in.
+
+    A running exe can't be overwritten on Windows but it can be renamed, so the old
+    one moves aside to BulkCrop.old.exe (deleted on a later start) and the new one
+    takes its name. Anything still running the old one, e.g. a background job, keeps going.
+    """
+    target = update_target()
+    new = sibling(target, "new")
+    req = urllib.request.Request(url, headers={"User-Agent": f"BulkCrop/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(new, "wb") as f:
+            shutil.copyfileobj(r, f, 1024 * 1024)
+        data = new.read_bytes()
+        if FROZEN:
+            if data[:2] != b"MZ" or len(data) < 1024 * 1024:
+                raise RuntimeError("the downloaded file isn't a valid program")
+            old = sibling(target, "old")
+            old.unlink(missing_ok=True)
+            os.replace(target, old)
+            try:
+                os.replace(new, target)
+            except OSError:
+                os.replace(old, target)
+                raise
+        else:
+            compile(data, str(target), "exec")  # refuse a broken download
+            os.replace(new, target)
+    finally:
+        new.unlink(missing_ok=True)
+    log.info("Updated from %s", url)
+
+
+def cleanup_old_update():
+    try:
+        sibling(update_target(), "old").unlink(missing_ok=True)
+    except OSError:
+        pass  # still running, e.g. a background job started before the update
+
+
+def relaunch(state):
+    """Start a fresh window on the same folders (after an update)."""
+    if FROZEN:
+        cmd = [str(update_target())]
+    else:
+        exe = Path(sys.executable)
+        if exe.with_name("pythonw.exe").exists():
+            exe = exe.with_name("pythonw.exe")
+        cmd = [str(exe), str(update_target())]
+    subprocess.Popen(cmd + [str(state.input_root), "-o", str(state.output_root)], close_fds=True,
+                     creationflags=subprocess.DETACHED_PROCESS if os.name == "nt" else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +824,8 @@ class App:
         self.row_cache = {}
         self.flash_text, self.flash_until = "", 0.0
         self.ticks = 0
+        self.update_info = None  # (tag, url, notes) once a newer release is found
+        self.update_done = None  # while installing it: False, then True or an error message
         self._build_ui()
         if self.rels:
             undecided = [i for i, r in enumerate(self.rels) if state.videos[r]["action"] is None]
@@ -739,12 +835,13 @@ class App:
                                     text="No videos found. Other files are still being copied.")
         self._refresh()
         self.tick()
+        threading.Thread(target=self._check_update, daemon=True).start()
 
     # -- layout --------------------------------------------------------------
 
     def _build_ui(self):
         tk, ttk, r = self.tk, self.ttk, self.root
-        r.title("Bulk Crop")
+        r.title(f"Bulk Crop  v{VERSION}")
         r.geometry("1400x860")
         r.minsize(900, 600)
         r.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -754,6 +851,7 @@ class App:
         ttk.Label(top, text=f"From:  {self.state.input_root}      To:  {self.state.output_root}").pack(side="left")
         ttk.Button(top, text="Open output folder",
                    command=lambda: os.startfile(self.state.output_root)).pack(side="right")
+        self.update_btn = ttk.Button(top, command=self.update)  # shown once a newer release is found
         ttk.Button(top, text="Retry failed / resume", command=self.retry_failed).pack(side="right", padx=6)
         self.n_workers = tk.IntVar(value=self.state.workers)
         ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_workers, state="readonly",
@@ -1422,6 +1520,55 @@ class App:
             text = f"⚠ {hold}          {text}"
         self.status.config(text=text, foreground="#c00000" if hold else "")
 
+    # -- updates -------------------------------------------------------------
+
+    def _check_update(self):
+        try:
+            self.update_info = check_for_update()
+        except Exception as e:  # offline, blocked, rate-limited...: try again next start
+            log.info("Update check failed: %s", e)
+
+    def update(self):
+        from tkinter import messagebox
+        if self.update_done is not None:
+            return  # already installing
+        tag, url, notes = self.update_info
+        if len(notes) > 600:
+            notes = notes[:600] + "..."
+        if not messagebox.askyesno("Bulk Crop", f"Version {tag} is available (you have v{VERSION}).\n\n"
+                                                f"{notes}\n\nDownload and install it now?"):
+            return
+        self.update_done = False
+        self.update_btn.config(text="Downloading update...", state="disabled")
+
+        def work():
+            try:
+                install_update(url)
+                self.update_done = True
+            except Exception as e:
+                log.info("Update failed: %s", e)
+                self.update_done = str(e) or type(e).__name__
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_finished(self):
+        from tkinter import messagebox
+        result, self.update_done = self.update_done, None
+        tag = self.update_info[0]
+        if result is not True:
+            self.update_btn.config(text=f"⬆ Update to {tag}", state="normal")
+            if messagebox.askyesno("Bulk Crop", f"The update couldn't be installed:\n{result}\n\n"
+                                                "Open the download page to get it by hand?"):
+                os.startfile(f"https://github.com/{REPO}/releases/latest")
+            return False
+        self.update_info = None
+        self.update_btn.pack_forget()
+        if messagebox.askyesno("Bulk Crop", f"Updated to {tag}.\n\nRestart now to use it? Videos that are "
+                                            "encoding right now will start over.\n\n(No = the new version "
+                                            "is used next time you open Bulk Crop.)"):
+            self.on_close(restart=True)
+            return True
+        return False
+
     def flash(self, msg):
         self.flash_text, self.flash_until = msg, time.time() + 4
         self.root.bell()
@@ -1433,6 +1580,11 @@ class App:
             self._display(key, fut)
         if isinstance(self.applying, tuple):
             self._applied()
+        if self.update_info and self.update_done is None and not self.update_btn.winfo_ismapped():
+            self.update_btn.config(text=f"⬆ Update to {self.update_info[0]}")
+            self.update_btn.pack(side="right", padx=6)
+        if self.update_done not in (None, False) and self._update_finished():
+            return  # restarting: the window is gone
         self.ticks += 1
         if self.ticks % 5 == 0:
             self._refresh()
@@ -1445,11 +1597,11 @@ class App:
                 self._update_labels()
         self.root.after(100, self.tick)
 
-    def on_close(self):
+    def on_close(self, restart=False):
         from tkinter import messagebox
         busy = self.state.has_work()
         background = False
-        if busy:
+        if busy and not restart:
             background = messagebox.askyesnocancel(
                 "Bulk Crop",
                 "Some videos are still encoding or waiting.\n\n"
@@ -1469,6 +1621,8 @@ class App:
             pass
         if busy and background:
             launch_background(self.state)
+        if restart:
+            relaunch(self.state)
         for th in self.thumbs.values():
             th.cancel()
         self.previews.shutdown(wait=False, cancel_futures=True)
@@ -1481,6 +1635,7 @@ class App:
 def open_gui(input_arg, output_arg):
     import tkinter as tk
     from tkinter import filedialog, messagebox
+    cleanup_old_update()
     root = tk.Tk()
     root.withdraw()
     if not (FFMPEG and FFPROBE):
@@ -1545,6 +1700,7 @@ def main():
     ap.add_argument("input", nargs="?", help="top folder containing the videos")
     ap.add_argument("-o", "--output", help="where to write the mirrored, cropped tree")
     ap.add_argument("--process", metavar="STATE", help="headless: finish queued jobs in this state file")
+    ap.add_argument("--version", action="version", version=f"Bulk Crop {VERSION}")
     args = ap.parse_args()
     if args.process:
         if not (FFMPEG and FFPROBE):
