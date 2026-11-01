@@ -40,8 +40,18 @@ STATE_NAME = "_bulk_crop_state.json"
 LOG_NAME = "_bulk_crop_log.txt"
 PID_NAME = "_bulk_crop_worker.pid"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-FFMPEG = shutil.which("ffmpeg")
-FFPROBE = shutil.which("ffprobe")
+FROZEN = getattr(sys, "frozen", False)  # running as the packaged BulkCrop.exe
+APP_DIR = Path(sys.executable if FROZEN else __file__).resolve().parent
+
+
+def find_tool(name):
+    """A copy of the tool next to the app (as shipped in the release zip), else one on PATH."""
+    local = APP_DIR / f"{name}.exe"
+    return str(local) if os.name == "nt" and local.exists() else shutil.which(name)
+
+
+FFMPEG = find_tool("ffmpeg")
+FFPROBE = find_tool("ffprobe")
 MIN_FREE_BYTES = 2 * 1024 ** 3  # don't start an encode with less than this free on the output drive
 RETRY_DELAYS = (10, 60)          # seconds to wait before the 2nd and 3rd attempt at a job
 
@@ -172,11 +182,15 @@ def pid_alive(pid):
 
 def launch_background(state):
     """Start a detached process that finishes every queued job in state."""
-    exe = Path(sys.executable)
-    if exe.with_name("pythonw.exe").exists():
-        exe = exe.with_name("pythonw.exe")
+    if FROZEN:
+        cmd = [sys.executable]
+    else:
+        exe = Path(sys.executable)
+        if exe.with_name("pythonw.exe").exists():
+            exe = exe.with_name("pythonw.exe")
+        cmd = [str(exe), str(Path(__file__).resolve())]
     flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
-    subprocess.Popen([str(exe), str(Path(__file__).resolve()), "--process", str(state.path)],
+    subprocess.Popen(cmd + ["--process", str(state.path)],
                      creationflags=flags, close_fds=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=os.name != "nt")
