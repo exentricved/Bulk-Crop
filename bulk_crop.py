@@ -9,6 +9,8 @@ Bulk Crop - set crops for many videos in one sitting, encode them in the backgro
      (lossless H.264) starts right away in the background while you move on.
      Boxes carry over to the next video, and "Apply to all remaining" saves them
      on every undecided video with the same frame size in one go.
+     To keep only some parts of a video, mark each part's start [I] and end [O];
+     the parts are joined in order.
   4. If you close the window with work still pending, the rest can be handed
      off to a background process that keeps going without the window.
 
@@ -41,7 +43,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO = "exentricved/Bulk-Crop"
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".mpg", ".mpeg",
               ".webm", ".flv", ".mts", ".m2ts", ".ts", ".3gp"}
@@ -158,6 +160,27 @@ def probe(src):
     except (KeyError, ValueError, TypeError):
         pass
     return info
+
+
+def has_audio(src):
+    try:
+        out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                              "-of", "csv=p=0", str(src)], capture_output=True, text=True, errors="replace",
+                             timeout=300, creationflags=NO_WINDOW).stdout
+    except subprocess.SubprocessError:
+        return False
+    return bool(out.strip())
+
+
+def merge_segments(segments):
+    """[start, end] parts sorted, with overlapping ones joined."""
+    merged = []
+    for a, b in sorted(list(x) for x in segments):
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
 
 
 def extract_frame(src, t, out_img):
@@ -484,14 +507,17 @@ class State:
             self.videos, self.files = videos, files
             self.changed()
 
-    def decide(self, rel, action, crop=None, masks=None):
+    def decide(self, rel, action, crop=None, masks=None, keep=None):
+        """keep: the [start, end] parts (seconds) to keep, joined in order; None keeps the whole video."""
         masks = masks or []
+        keep = keep or None
         with self.lock:
             job = self.videos[rel]
             if job["action"] == action and job["crop"] == crop and job.get("masks", []) == masks \
-                    and job["status"] != "failed":
+                    and job.get("keep") == keep and job["status"] != "failed":
                 return
-            job.update(action=action, crop=crop, masks=masks, status="queued", error=None, rev=job["rev"] + 1)
+            job.update(action=action, crop=crop, masks=masks, keep=keep, status="queued", error=None,
+                       rev=job["rev"] + 1)
             job.pop("attempts", None)
             job.pop("retry_at", None)
             self.changed()
@@ -669,7 +695,7 @@ class Workers:
         dst.parent.mkdir(parents=True, exist_ok=True)
         if kind == "file" or job["action"] == "copy":
             return self._copy(src, dst)
-        return self._encode(idx, rel, src, dst, job["crop"], job.get("masks") or [])
+        return self._encode(idx, rel, src, dst, job["crop"], job.get("masks") or [], job.get("keep"))
 
     def _copy(self, src, dst):
         s = src.stat()
@@ -682,8 +708,9 @@ class Workers:
         replace_with_retry(tmp, dst)
         return None
 
-    def _encode(self, idx, rel, src, dst, crop, masks):
-        """Black out each mask box (in full-frame pixels), then crop (crop None = keep the full frame)."""
+    def _encode(self, idx, rel, src, dst, crop, masks, keep=None):
+        """Keep only the [start, end] parts in keep (None = all of it), black out each mask box
+        (in full-frame pixels), then crop (crop None = keep the full frame)."""
         info = probe(src)
         duration = info["duration"]
         filters = [f"drawbox=x={x}:y={y}:w={w}:h={h}:color=black:t=fill" for x, y, w, h in masks]
@@ -692,6 +719,11 @@ class Workers:
             filters.append(f"crop={w}:{h}:{x}:{y}")
         else:
             w, h = info["width"], info["height"]
+        if keep:
+            if duration > 0:
+                keep = [[a, min(b, duration)] for a, b in keep if a < duration - 0.05]
+            if not keep:
+                return "the parts to keep are past the end of this video"
         tmp = dst.with_name(f"{dst.stem}.partial{dst.suffix}")
         if dst.suffix.lower() == ".webm":
             vcodec = ["-c:v", "libvpx-vp9", "-lossless", "1", "-row-mt", "1"]
@@ -702,17 +734,32 @@ class Workers:
             # qp 0 is lossless at any preset; ultrafast just trades file size for speed
             vcodec = ["-c:v", "libx264rgb" if rgb else "libx264", "-preset", "ultrafast", "-qp", "0"]
             acodec = ["-c:a", "aac", "-b:a", "256k"]
-        base = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-nostats",
-                "-progress", "pipe:1", "-i", str(src), "-map", "0:v:0", "-map", "0:a?",
-                "-vf", ",".join(filters), *vcodec, "-map_metadata", "0"]
-        error = None
-        # copy the audio untouched; if the container won't take it, re-encode it
-        for audio in (["-c:a", "copy"], acodec):
-            error = self._ffmpeg(idx, rel, base + audio + [str(tmp)], duration)
-            if error is None or self.stopping or is_disk_full(error):
-                break
+        head = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+        if keep:
+            # each part is its own input, seeked to frame-accurately (only the kept frames are decoded),
+            # then the parts are joined and the boxes applied once
+            audio = has_audio(src)
+            inputs, pads = [], ""
+            for i, (a, b) in enumerate(keep):
+                inputs += ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", str(src)]
+                pads += f"[{i}:v:0]" + (f"[{i}:a:0]" if audio else "")
+            graph = (f"{pads}concat=n={len(keep)}:v=1:a={int(audio)}[cat]" + ("[a]" if audio else "")
+                     + f";[cat]{','.join(filters) or 'null'}[v]")
+            expected = sum(b - a for a, b in keep)
+            cmd = head + inputs + ["-filter_complex", graph, "-map", "[v]", *(["-map", "[a]"] if audio else []),
+                                   *vcodec, *acodec, "-map_metadata", "0", str(tmp)]
+            error = self._ffmpeg(idx, rel, cmd, expected)
+        else:
+            expected = duration
+            base = head + ["-i", str(src), "-map", "0:v:0", "-map", "0:a?",
+                           "-vf", ",".join(filters) or "null", *vcodec, "-map_metadata", "0"]
+            # copy the audio untouched; if the container won't take it, re-encode it
+            for audio in (["-c:a", "copy"], acodec):
+                error = self._ffmpeg(idx, rel, base + audio + [str(tmp)], duration)
+                if error is None or self.stopping or is_disk_full(error):
+                    break
         if error is None:
-            error = self._verify(tmp, w, h, duration)
+            error = self._verify(tmp, w, h, expected)
         if error is None:
             replace_with_retry(tmp, dst)
         else:
@@ -721,12 +768,12 @@ class Workers:
 
     @staticmethod
     def _verify(path, w, h, src_duration):
-        """Make sure a finished encode has the expected size and (nearly) the original's length."""
+        """Make sure a finished encode has the expected size and (nearly) the expected length."""
         out = probe(path)
         if (out["width"], out["height"]) != (w, h):
             return f"output check failed: expected {w}x{h}, got {out['width']}x{out['height']}"
         if src_duration > 0 and out["duration"] < src_duration - max(1.0, 0.01 * src_duration):
-            return f"output check failed: {out['duration']:.1f}s long, original is {src_duration:.1f}s"
+            return f"output check failed: {out['duration']:.1f}s long, expected {src_duration:.1f}s"
         return None
 
     def _ffmpeg(self, idx, rel, cmd, duration):
@@ -778,10 +825,13 @@ def fmt_time(t):
     return f"{int(t // 60)}:{t % 60:04.1f}"
 
 
-def describe_edit(crop, masks):
+def describe_edit(crop, masks, keep=None):
     parts = [f"crop {crop[2]}×{crop[3]} at ({crop[0]}, {crop[1]})" if crop else "full frame"]
     if masks:
         parts.append(f"{len(masks)} black-out box" + ("es" if len(masks) > 1 else ""))
+    if keep:
+        parts.append(f"keep {len(keep)} part" + ("s" if len(keep) > 1 else "")
+                     + f" ({fmt_time(sum(b - a for a, b in keep))} total)")
     return " + ".join(parts)
 
 
@@ -809,6 +859,9 @@ class App:
         self.origin = (0, 0)
         self.rect = None        # crop box [x0, y0, x1, y1] in source pixels
         self.masks = []         # black-out boxes, same form
+        self.segments = []      # [start, end] parts of the video to keep, in seconds; [] keeps all of it
+        self.mark_in = None     # a part's start, marked but not yet ended
+        self.duration = 0.0     # of the current video
         self.tool = tk.StringVar(value="crop")  # what dragging on empty frame draws: "crop" or "mask"
         self.drag = None
         last = next((j for j in reversed(list(state.videos.values())) if j["action"] == "crop"), None)
@@ -911,9 +964,19 @@ class App:
         self.strip.bind("<ButtonPress-1>", self._strip_seek)
         self.strip.bind("<B1-Motion>", self._strip_seek)
         self.strip.bind("<ButtonRelease-1>", lambda e: self._load_full_soon(0))
+        self.strip.bind("<ButtonPress-3>", self._strip_delete)
         self.strip.bind("<Configure>", lambda e: self._draw_strip(force=True))
         for w in (self.strip, self.canvas):
             w.bind("<MouseWheel>", lambda e: self._step(-1 if e.delta > 0 else 1))
+
+        parts = ttk.Frame(right, padding=(6, 0))
+        parts.pack(fill="x")
+        ttk.Label(parts, text="Keep only parts:").pack(side="left")
+        ttk.Button(parts, text="Start here  [I]", command=self.mark_start, takefocus=False).pack(side="left", padx=4)
+        ttk.Button(parts, text="End here  [O]", command=self.mark_end, takefocus=False).pack(side="left", padx=4)
+        ttk.Button(parts, text="Clear parts", command=self.clear_segments, takefocus=False).pack(side="left", padx=4)
+        ttk.Label(parts, text="As many as you like, joined in order. Right-click one on the filmstrip "
+                              "to remove it. None = whole video.").pack(side="left", padx=8)
 
         self.crop_label = ttk.Label(right, padding=(6, 2))
         self.crop_label.pack(fill="x")
@@ -944,6 +1007,7 @@ class App:
                         ("<Right>", self.next), ("<Left>", self.prev), ("p", self.reuse), ("P", self.reuse),
                         ("u", self.copy_as_is), ("U", self.copy_as_is), ("b", self.switch_tool),
                         ("B", self.switch_tool), ("a", self.apply_all), ("A", self.apply_all),
+                        ("i", self.mark_start), ("I", self.mark_start), ("o", self.mark_end), ("O", self.mark_end),
                         ("[", lambda: self._step(-1)), ("]", lambda: self._step(1))):
             r.bind(seq, key(fn))
 
@@ -956,10 +1020,11 @@ class App:
         self.index = i % len(self.rels)
         rel = self.current()
         job = self.state.videos[rel]
-        self.rect, self.masks = None, []
+        self.rect, self.masks, self.segments, self.mark_in = None, [], [], None
         if job["action"] == "crop":
             self.rect = self._corners(job["crop"]) if job["crop"] else None
             self.masks = [self._corners(m) for m in job.get("masks") or []]
+            self.segments = [list(x) for x in job.get("keep") or []]
         self.carry = job["action"] is None and self.last_edit is not None
         if self.tree.selection() != (rel,):
             self.tree.selection_set(rel)
@@ -1068,6 +1133,7 @@ class App:
             img = self.tk.PhotoImage(data=hit[1], format="PPM").subsample(k)
             self.strip_imgs.append(img)
             self.strip.create_image(x0 + i * tile_w, 2, image=img, anchor="nw")
+        self._draw_strip_segments()
         self._draw_strip_marker()
 
     def _draw_strip_marker(self):
@@ -1078,6 +1144,82 @@ class App:
             t = self.thumb_t if self.thumb_t is not None else self.time_var.get()
             x = x0 + (x1 - x0) * min(max(t / th.duration, 0), 1)
             self.strip.create_line(x, 0, x, 54, fill="#ffd400", width=3, tags="marker")
+
+    def _strip_x(self, t):
+        x0, x1 = self.strip_span
+        return x0 + (x1 - x0) * min(max(t / self.thumbs[self.current()].duration, 0), 1)
+
+    def _draw_strip_segments(self):
+        """Shade the parts that will be cut out, outline the kept parts, show a pending start."""
+        self.strip.delete("segs")
+        th = self.thumbs.get(self.current())
+        if not (th and th.times and th.duration > 0):
+            return
+        X = self._strip_x
+        if self.segments:
+            edges = [0.0] + [t for seg in self.segments for t in seg] + [th.duration]
+            for a, b in zip(edges[::2], edges[1::2]):  # the gaps between kept parts
+                if b > a:
+                    self.strip.create_rectangle(X(a), 0, X(b), 54, fill="black", stipple="gray75",
+                                                outline="", tags="segs")
+            for a, b in self.segments:
+                self.strip.create_rectangle(X(a), 1, X(b), 53, outline="#30d050", width=2, tags="segs")
+        if self.mark_in is not None:
+            x = X(self.mark_in)
+            self.strip.create_line(x, 0, x, 54, fill="#30d050", width=3, dash=(4, 2), tags="segs")
+        self.strip.tag_raise("marker")
+
+    # -- keeping only parts of a video ---------------------------------------
+
+    def _now(self):
+        return self.thumb_t if self.thumb_t is not None else self.time_var.get()
+
+    def mark_start(self):
+        if self.photo:
+            self.mark_in = round(self._now(), 3)
+            self._segments_changed()
+
+    def mark_end(self):
+        if not self.photo:
+            return
+        t = round(self._now(), 3)
+        start = self.mark_in
+        if start is None:  # no start marked: from the end of the part before, or the beginning
+            start = max((b for a, b in self.segments if b <= t), default=0.0)
+        if abs(t - start) < 0.1:
+            self.flash("That part would be empty. Move to a later frame, then press O.")
+            return
+        self.mark_in = None
+        self.segments = merge_segments(self.segments + [[min(start, t), max(start, t)]])
+        self._segments_changed()
+
+    def clear_segments(self):
+        self.segments, self.mark_in = [], None
+        self._segments_changed()
+
+    def _strip_delete(self, e):
+        """Right-click on the filmstrip: remove the kept part (or pending start) there."""
+        th = self.thumbs.get(self.current())
+        x0, x1 = self.strip_span
+        if not (th and th.duration > 0 and x1 > x0):
+            return
+        if self.mark_in is not None and abs(e.x - self._strip_x(self.mark_in)) <= 6:
+            self.mark_in = None
+        else:
+            t = min(max((e.x - x0) / (x1 - x0), 0), 1) * th.duration
+            self.segments = [seg for seg in self.segments if not seg[0] <= t <= seg[1]]
+        self._segments_changed()
+
+    def _keep_values(self):
+        """The parts to save (a pending start runs to the end of the video), or None to keep it all."""
+        segs = list(self.segments)
+        if self.mark_in is not None and self.duration - self.mark_in >= 0.1:
+            segs.append([self.mark_in, round(self.duration, 3)])
+        return merge_segments(segs) or None
+
+    def _segments_changed(self):
+        self._draw_strip_segments()
+        self._update_labels()
 
     def next(self):
         if self.rels:
@@ -1108,12 +1250,15 @@ class App:
         rel = self.current()
         if not rel:
             return
-        if not ((self.rect or self.masks) and self.photo):
-            self.flash("Draw a crop box or a black-out box first, or press U to copy this video unchanged.")
+        keep = self._keep_values()
+        if not ((self.rect or self.masks or keep) and self.photo):
+            self.flash("Draw a crop box or a black-out box, or mark parts to keep, first. "
+                       "Or press U to copy this video unchanged.")
             return
         crop, masks = self._edit_values()
-        self.state.decide(rel, "crop", crop, masks)
-        self.last_edit = (crop, masks)
+        self.state.decide(rel, "crop", crop, masks, keep)
+        if crop or masks:
+            self.last_edit = (crop, masks)
         self._advance()
 
     def copy_as_is(self):
@@ -1166,9 +1311,11 @@ class App:
         if not messagebox.askyesno(
                 "Bulk Crop", f"Apply these boxes to this video and the {len(targets) - 1} other videos "
                              "that don't have a decision yet?\n\nVideos with a different frame size are "
-                             "skipped and left for you to do."):
+                             "skipped and left for you to do. Parts to keep are only saved on this video; "
+                             "the others are kept whole."):
             return
         crop, masks = self._edit_values()
+        keep = self._keep_values()  # parts differ from video to video: only this one keeps them
         self.applying = "running"
         self.flash_text, self.flash_until = f"Checking frame sizes of {len(targets)} videos…", time.time() + 3600
         self._refresh()
@@ -1186,7 +1333,7 @@ class App:
                 same = [r for r, s in zip(targets, sizes) if s == size and s[0]]
                 for r in same:
                     if r == rel or self.state.videos[r]["action"] is None:  # may have changed meanwhile
-                        self.state.decide(r, "crop", crop, masks)
+                        self.state.decide(r, "crop", crop, masks, keep if r == rel else None)
             except Exception as e:
                 log.info("apply to all failed: %s", e)
             finally:
@@ -1256,6 +1403,7 @@ class App:
         except OSError:
             pass
         self.src_size = (self.photo.width(), self.photo.height())
+        self.duration = duration
         self.thumb, self.thumb_t = None, t
         if self.carry:  # undecided video: start from the last saved boxes, so Enter accepts them
             self.carry = False
@@ -1473,14 +1621,17 @@ class App:
         job = self.state.videos[rel]
         size = f"     ({self.src_size[0]}×{self.src_size[1]})" if self.photo else ""
         self.info.config(text=f"{self.index + 1} / {len(self.rels)}     {rel}{size}")
-        if (self.rect or self.masks) and self.photo:
-            text = "Now: " + describe_edit(*self._edit_values())
+        keep = self._keep_values() if self.photo else None
+        if (self.rect or self.masks or keep) and self.photo:
+            text = "Now: " + describe_edit(*self._edit_values(), keep)
+            if self.mark_in is not None:
+                text += f"  (part started at {fmt_time(self.mark_in)}: press O at its end, or it runs to the end)"
         elif self.tool.get() == "crop":
             text = "Drag on the frame to draw a crop box. Drag inside it to move it, drag its edges to resize."
         else:
             text = "Drag on the frame to draw a black-out box. Drag inside one to move it, drag its edges to resize."
         if job["action"] == "crop":
-            text += "          Saved: " + describe_edit(job["crop"], job.get("masks") or [])
+            text += "          Saved: " + describe_edit(job["crop"], job.get("masks") or [], job.get("keep"))
         elif job["action"] == "copy":
             text += "          Saved: copy unchanged"
         if job["status"] == "failed":

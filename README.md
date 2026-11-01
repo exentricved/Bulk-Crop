@@ -14,10 +14,15 @@ sitting; encoding (lossless H.264) runs in the background.
    - **Crop box** (yellow): the area to keep.
    - **Black-out box** (red outline, filled black): areas to hide. Draw as many as you like; right-click one to delete it.
    - Press **B** to switch between the two. Boxes are always stored in the original video's pixels.
-6. Press **Enter** to save and go to the next video (or **U** to copy it unchanged). Encoding starts right away.
+6. To keep only some parts of the video (e.g. just the EUS sections), go to the start of a part and press **I**,
+   then to its end and press **O**. Mark as many parts as you like; they're joined in order and the cut parts are
+   dimmed on the filmstrip. Right-click a part on the filmstrip to remove it. A start with no end runs to the end of
+   the video; with nothing marked, the whole video is kept. Cuts are frame-accurate.
+7. Press **Enter** to save and go to the next video (or **U** to copy it unchanged). Encoding starts right away.
    - Your boxes carry over to the next video, so the same layout is just **Enter**.
    - **Apply to all remaining [A]** saves the boxes on every undecided video with the same frame size in one go.
-7. Close the window whenever you like. If work is still pending, choose **Yes** to keep encoding in the background.
+     Parts to keep aren't copied to the other videos.
+8. Close the window whenever you like. If work is still pending, choose **Yes** to keep encoding in the background.
 
 Reopen the same folder at any time to pick up where you left off. Progress is saved in
 `<output>/_bulk_crop_state.json`, and a log is kept in `<output>/_bulk_crop_log.txt`.
