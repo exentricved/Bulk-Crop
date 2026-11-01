@@ -5,8 +5,10 @@ Bulk Crop - set crops for many videos in one sitting, encode them in the backgro
   1. Pick the top folder that holds your videos (any depth of subfolders).
   2. Output goes to a parallel "<folder>_cropped" tree with identical subfolders.
      Non-video files, and videos you choose not to crop, are copied over unchanged.
-  3. Draw a crop box on each video and press Enter. Encoding (lossless H.264)
-     starts right away in the background while you move on to the next video.
+  3. Draw a crop box and/or black-out boxes on each video and press Enter. Encoding
+     (lossless H.264) starts right away in the background while you move on.
+     Boxes carry over to the next video, and "Apply to all remaining" saves them
+     on every undecided video with the same frame size in one go.
   4. If you close the window with work still pending, the rest can be handed
      off to a background process that keeps going without the window.
 
@@ -20,6 +22,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import itertools
 import json
 import logging
@@ -54,6 +57,8 @@ FFMPEG = find_tool("ffmpeg")
 FFPROBE = find_tool("ffprobe")
 MIN_FREE_BYTES = 2 * 1024 ** 3  # don't start an encode with less than this free on the output drive
 RETRY_DELAYS = (10, 60)          # seconds to wait before the 2nd and 3rd attempt at a job
+THUMB_WIDTH = 400                # scrubbing previews: small frames this wide...
+THUMB_COUNT = 240                # ...about this many spread over each video
 
 # (text found in the error, plain-English explanation)
 FRIENDLY_ERRORS = [
@@ -149,17 +154,129 @@ def probe(src):
     return info
 
 
-def extract_frame(src, t, out_png):
-    """Write one frame of src at t seconds (falling back to the start) to out_png."""
+def extract_frame(src, t, out_img):
+    """Write one frame of src at t seconds (falling back to the start) to out_img. Use .ppm:
+    uncompressed, so much quicker than PNG on noisy (e.g. ultrasound) frames."""
     for when in (t, 0.0):
         r = subprocess.run(
             [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-             "-ss", f"{when:.3f}", "-i", str(src), "-frames:v", "1", "-update", "1", out_png],
+             "-ss", f"{when:.3f}", "-i", str(src), "-frames:v", "1", "-update", "1", out_img],
             capture_output=True, text=True, errors="replace", timeout=300,
             creationflags=NO_WINDOW)
-        if r.returncode == 0 and os.path.exists(out_png) and os.path.getsize(out_png) > 0:
+        if r.returncode == 0 and os.path.exists(out_img) and os.path.getsize(out_img) > 0:
             return
     raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "could not read a frame")
+
+
+def read_ppm(f):
+    """One binary PPM image (header included) from a pipe, or None at the end."""
+    header = b""
+    while header.count(b"\n") < 3:
+        c = f.read(1)
+        if not c:
+            return None
+        header += c
+    w, h = map(int, header.split(b"\n")[1].split())
+    data = f.read(w * h * 3)
+    return header + data if len(data) == w * h * 3 else None
+
+
+class Thumbs:
+    """Small frames spread across a whole video, made in the background so scrubbing is instant.
+    Frames are PPM bytes (Tk loads those without extra libraries), kept sorted by time."""
+
+    def __init__(self, src):
+        self.times, self.frames = [], []
+        self.duration = 0.0
+        self.version = 0      # bumps whenever frames arrive
+        self.done = False
+        self.cancelled = False
+        self.proc = None
+        self.lock = threading.Lock()
+        threading.Thread(target=self._run, args=(src,), daemon=True).start()
+
+    def cancel(self):
+        self.cancelled = True
+        try:
+            if self.proc:
+                self.proc.kill()
+        except OSError:
+            pass
+
+    def nearest(self, t):
+        """(time, frame) closest to t, or None if nothing yet."""
+        with self.lock:
+            if not self.times:
+                return None
+            i = bisect.bisect(self.times, t)
+            if i == len(self.times) or (i > 0 and t - self.times[i - 1] < self.times[i] - t):
+                i -= 1
+            return self.times[i], self.frames[i]
+
+    def step(self, t, direction):
+        """Time of the frame just after (direction 1) or before (-1) t, or None."""
+        with self.lock:
+            if direction > 0:
+                i = bisect.bisect_right(self.times, t + 1e-3)
+                return self.times[i] if i < len(self.times) else None
+            i = bisect.bisect_left(self.times, t - 1e-3) - 1
+            return self.times[i] if i >= 0 else None
+
+    def _run(self, src):
+        try:
+            self.duration = probe(src)["duration"]
+            d = self.duration
+            # keyframes only: nothing else gets decoded, so even long videos take seconds
+            gap = d / THUMB_COUNT if d > 0 else 0
+            self._pass(["-skip_frame", "nokey", "-i", str(src)],
+                       f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{gap:.3f})'")
+            if not self.cancelled and d > 0 and len(self.times) < min(40, d / 3):
+                # too few keyframes (some recorders write one every few minutes): decode it all instead
+                self._pass(["-i", str(src)], f"fps={THUMB_COUNT / d:.6f}")
+        except Exception as e:
+            log.info("preview strip failed for %s: %s", src, e)
+        finally:
+            self.done = True
+            self.version += 1
+
+    def _pass(self, inputs, pick):
+        cmd = [FFMPEG, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", *inputs,
+               "-map", "0:v:0", "-vf", f"{pick},scale={THUMB_WIDTH}:-2:flags=fast_bilinear,showinfo",
+               "-fps_mode", "passthrough", "-f", "image2pipe", "-c:v", "ppm", "-"]
+        self.proc = proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        times = []  # from showinfo, one per frame, in output order
+
+        def read_times():
+            for line in proc.stderr:
+                i = line.find(b" pts_time:")
+                if i >= 0:
+                    try:
+                        times.append(float(line[i + 10:].split()[0]))
+                    except (ValueError, IndexError):
+                        times.append(None)
+        reader = threading.Thread(target=read_times, daemon=True)
+        reader.start()
+        n = 0
+        try:
+            while not self.cancelled:
+                frame = read_ppm(proc.stdout)
+                if frame is None:
+                    break
+                while len(times) <= n and reader.is_alive():
+                    time.sleep(0.005)
+                t = times[n] if n < len(times) else None
+                n += 1
+                if t is None:
+                    continue
+                with self.lock:
+                    i = bisect.bisect(self.times, t)
+                    self.times.insert(i, t)
+                    self.frames.insert(i, frame)
+                    self.version += 1
+        finally:
+            proc.kill()
+            proc.wait()
 
 
 def pid_alive(pid):
@@ -200,7 +317,8 @@ def launch_background(state):
 # job state (shared by the window, the encoder threads and the headless worker)
 
 class State:
-    """Videos: action None (undecided) / "crop" / "copy"; status todo/queued/done/failed.
+    """Videos: action None (undecided) / "crop" (re-encode with "crop" [x, y, w, h] or None for the
+    full frame, plus "masks", a list of [x, y, w, h] boxes to black out) / "copy"; status todo/queued/done/failed.
     Other files: always copied; status queued/done/failed. "rev" bumps whenever a
     decision changes, so a job that changed mid-encode gets redone."""
 
@@ -272,12 +390,14 @@ class State:
             self.videos, self.files = videos, files
             self.changed()
 
-    def decide(self, rel, action, crop=None):
+    def decide(self, rel, action, crop=None, masks=None):
+        masks = masks or []
         with self.lock:
             job = self.videos[rel]
-            if job["action"] == action and job["crop"] == crop and job["status"] != "failed":
+            if job["action"] == action and job["crop"] == crop and job.get("masks", []) == masks \
+                    and job["status"] != "failed":
                 return
-            job.update(action=action, crop=crop, status="queued", error=None, rev=job["rev"] + 1)
+            job.update(action=action, crop=crop, masks=masks, status="queued", error=None, rev=job["rev"] + 1)
             job.pop("attempts", None)
             job.pop("retry_at", None)
             self.changed()
@@ -455,7 +575,7 @@ class Workers:
         dst.parent.mkdir(parents=True, exist_ok=True)
         if kind == "file" or job["action"] == "copy":
             return self._copy(src, dst)
-        return self._crop(idx, rel, src, dst, job["crop"])
+        return self._encode(idx, rel, src, dst, job["crop"], job.get("masks") or [])
 
     def _copy(self, src, dst):
         s = src.stat()
@@ -468,10 +588,16 @@ class Workers:
         replace_with_retry(tmp, dst)
         return None
 
-    def _crop(self, idx, rel, src, dst, crop):
-        x, y, w, h = crop
+    def _encode(self, idx, rel, src, dst, crop, masks):
+        """Black out each mask box (in full-frame pixels), then crop (crop None = keep the full frame)."""
         info = probe(src)
         duration = info["duration"]
+        filters = [f"drawbox=x={x}:y={y}:w={w}:h={h}:color=black:t=fill" for x, y, w, h in masks]
+        if crop:
+            x, y, w, h = crop
+            filters.append(f"crop={w}:{h}:{x}:{y}")
+        else:
+            w, h = info["width"], info["height"]
         tmp = dst.with_name(f"{dst.stem}.partial{dst.suffix}")
         if dst.suffix.lower() == ".webm":
             vcodec = ["-c:v", "libvpx-vp9", "-lossless", "1", "-row-mt", "1"]
@@ -479,11 +605,12 @@ class Workers:
         else:
             # RGB sources (e.g. uncompressed AVI) stay RGB; plain libx264 would convert them to YUV
             rgb = (info["pix_fmt"] or "").startswith(RGB_PREFIXES)
-            vcodec = ["-c:v", "libx264rgb" if rgb else "libx264", "-preset", "veryfast", "-qp", "0"]
+            # qp 0 is lossless at any preset; ultrafast just trades file size for speed
+            vcodec = ["-c:v", "libx264rgb" if rgb else "libx264", "-preset", "ultrafast", "-qp", "0"]
             acodec = ["-c:a", "aac", "-b:a", "256k"]
         base = [FFMPEG, "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-nostats",
                 "-progress", "pipe:1", "-i", str(src), "-map", "0:v:0", "-map", "0:a?",
-                "-vf", f"crop={w}:{h}:{x}:{y}", *vcodec, "-map_metadata", "0"]
+                "-vf", ",".join(filters), *vcodec, "-map_metadata", "0"]
         error = None
         # copy the audio untouched; if the container won't take it, re-encode it
         for audio in (["-c:a", "copy"], acodec):
@@ -500,7 +627,7 @@ class Workers:
 
     @staticmethod
     def _verify(path, w, h, src_duration):
-        """Make sure a finished encode has the crop size and (nearly) the original's length."""
+        """Make sure a finished encode has the expected size and (nearly) the original's length."""
         out = probe(path)
         if (out["width"], out["height"]) != (w, h):
             return f"output check failed: expected {w}x{h}, got {out['width']}x{out['height']}"
@@ -557,6 +684,13 @@ def fmt_time(t):
     return f"{int(t // 60)}:{t % 60:04.1f}"
 
 
+def describe_edit(crop, masks):
+    parts = [f"crop {crop[2]}×{crop[3]} at ({crop[0]}, {crop[1]})" if crop else "full frame"]
+    if masks:
+        parts.append(f"{len(masks)} black-out box" + ("es" if len(masks) > 1 else ""))
+    return " + ".join(parts)
+
+
 class App:
     def __init__(self, root, state):
         import tkinter as tk
@@ -570,16 +704,28 @@ class App:
         self.index = 0
         self.photo = self.shown = None
         self.src_size = (0, 0)
-        self.sub = 1
+        self.scale = (1.0, 1.0)  # source pixels per screen pixel, x and y (boxes are kept in source pixels)
+        self.thumb = None       # small PhotoImage shown while scrubbing, until the full frame loads
+        self.thumb_t = None     # its time in seconds
+        self.thumbs = {}        # rel -> Thumbs, for the current and next video
+        self.full_load = None   # pending after() id: load the full frame once scrubbing pauses
+        self.strip_imgs = []
+        self.strip_key = None   # what the filmstrip currently shows, to skip needless redraws
+        self.strip_span = (0, 1)  # x range of the filmstrip tiles
         self.origin = (0, 0)
-        self.rect = None        # [x0, y0, x1, y1] in source pixels
+        self.rect = None        # crop box [x0, y0, x1, y1] in source pixels
+        self.masks = []         # black-out boxes, same form
+        self.tool = tk.StringVar(value="crop")  # what dragging on empty frame draws: "crop" or "mask"
         self.drag = None
-        self.last_crop = next((j["crop"] for j in reversed(list(state.videos.values())) if j["crop"]), None)
+        last = next((j for j in reversed(list(state.videos.values())) if j["action"] == "crop"), None)
+        self.last_edit = (last["crop"], last.get("masks") or []) if last else None  # carried to the next video
+        self.carry = False      # fill in last_edit once the current frame's size is known
+        self.applying = None    # result of "apply to all", handed from its thread to tick()
         self.frame_time = {}    # rel -> preview time in seconds
-        self.futures = {}       # (rel, t) -> future of (rel, t, duration, png)
+        self.futures = {}       # (rel, t) -> future of (rel, t, duration, image file)
         self.waiting = None     # (key, future) for the frame we're about to show
         self.cache_dir = tempfile.mkdtemp(prefix="bulk_crop_")
-        self.png_ids = itertools.count()
+        self.img_ids = itertools.count()
         self.previews = ThreadPoolExecutor(max_workers=3)
         self.row_cache = {}
         self.flash_text, self.flash_until = "", 0.0
@@ -646,6 +792,7 @@ class App:
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<ButtonPress-3>", self._delete_box)
         self.canvas.bind("<Motion>", self._hover)
         self.canvas.bind("<Configure>", lambda e: self.root.after_idle(self._render))
 
@@ -654,30 +801,52 @@ class App:
         ttk.Label(timebar, text="Preview frame at:").pack(side="left")
         self.time_var = tk.DoubleVar()
         self.time_scale = ttk.Scale(timebar, from_=0, to=1, variable=self.time_var, takefocus=False,
-                                    command=lambda _: self.time_label.config(text=fmt_time(self.time_var.get())))
+                                    command=lambda _: self._scrub(self.time_var.get(), from_slider=True))
         self.time_scale.pack(side="left", fill="x", expand=True, padx=6)
         self.time_scale.bind("<ButtonRelease-1>", self._time_released)
         self.time_label = ttk.Label(timebar, width=9)
         self.time_label.pack(side="left")
+        ttk.Label(timebar, text="   Wheel or [ ] steps").pack(side="left")
+        # filmstrip of the whole video: find the part you want at a glance, click or drag to jump there
+        self.strip = tk.Canvas(right, height=54, bg="#151515", highlightthickness=0, cursor="hand2")
+        self.strip.pack(fill="x", padx=6, pady=(0, 2))
+        self.strip.bind("<ButtonPress-1>", self._strip_seek)
+        self.strip.bind("<B1-Motion>", self._strip_seek)
+        self.strip.bind("<ButtonRelease-1>", lambda e: self._load_full_soon(0))
+        self.strip.bind("<Configure>", lambda e: self._draw_strip(force=True))
+        for w in (self.strip, self.canvas):
+            w.bind("<MouseWheel>", lambda e: self._step(-1 if e.delta > 0 else 1))
 
         self.crop_label = ttk.Label(right, padding=(6, 2))
         self.crop_label.pack(fill="x")
+        tools = ttk.Frame(right, padding=(6, 2))
+        tools.pack(fill="x")
+        ttk.Label(tools, text="Draw:").pack(side="left")
+        for value, text in (("crop", "Crop box"), ("mask", "Black-out box")):
+            ttk.Radiobutton(tools, text=text, value=value, variable=self.tool, command=self._draw_rect,
+                            takefocus=False).pack(side="left", padx=4)
+        ttk.Label(tools, text="[B] switches.   Draw as many black-out boxes as you like; "
+                              "right-click a box to delete it.").pack(side="left", padx=8)
         btns = ttk.Frame(right, padding=6)
         btns.pack(fill="x")
         ttk.Button(btns, text="◀ Prev", command=self.prev, takefocus=False).pack(side="left")
-        ttk.Button(btns, text="Clear box  [Esc]", command=self.clear, takefocus=False).pack(side="left", padx=4)
-        ttk.Button(btns, text="Reuse last crop  [P]", command=self.reuse, takefocus=False).pack(side="left", padx=4)
-        ttk.Button(btns, text="No crop, copy as-is  [U]", command=self.copy_as_is,
+        ttk.Button(btns, text="Clear boxes  [Esc]", command=self.clear, takefocus=False).pack(side="left", padx=4)
+        ttk.Button(btns, text="Reuse last boxes  [P]", command=self.reuse, takefocus=False).pack(side="left", padx=4)
+        ttk.Button(btns, text="Copy unchanged  [U]", command=self.copy_as_is,
                    takefocus=False).pack(side="left", padx=4)
         ttk.Button(btns, text="Next ▶", command=self.next, takefocus=False).pack(side="right")
-        ttk.Button(btns, text="✔  Crop & next  [Enter]", command=self.confirm,
+        ttk.Button(btns, text="✔  Save & next  [Enter]", command=self.confirm,
+                   takefocus=False).pack(side="right", padx=4)
+        ttk.Button(btns, text="Apply to all remaining  [A]", command=self.apply_all,
                    takefocus=False).pack(side="right", padx=4)
 
         def key(fn):
             return lambda e: None if isinstance(e.widget, (ttk.Spinbox, tk.Spinbox, ttk.Entry)) else fn()
         for seq, fn in (("<Return>", self.confirm), ("<KP_Enter>", self.confirm), ("<Escape>", self.clear),
                         ("<Right>", self.next), ("<Left>", self.prev), ("p", self.reuse), ("P", self.reuse),
-                        ("u", self.copy_as_is), ("U", self.copy_as_is)):
+                        ("u", self.copy_as_is), ("U", self.copy_as_is), ("b", self.switch_tool),
+                        ("B", self.switch_tool), ("a", self.apply_all), ("A", self.apply_all),
+                        ("[", lambda: self._step(-1)), ("]", lambda: self._step(1))):
             r.bind(seq, key(fn))
 
     # -- navigation ----------------------------------------------------------
@@ -689,14 +858,18 @@ class App:
         self.index = i % len(self.rels)
         rel = self.current()
         job = self.state.videos[rel]
-        self.rect = None
-        if job["crop"]:
-            x, y, w, h = job["crop"]
-            self.rect = [x, y, x + w, y + h]
+        self.rect, self.masks = None, []
+        if job["action"] == "crop":
+            self.rect = self._corners(job["crop"]) if job["crop"] else None
+            self.masks = [self._corners(m) for m in job.get("masks") or []]
+        self.carry = job["action"] is None and self.last_edit is not None
         if self.tree.selection() != (rel,):
             self.tree.selection_set(rel)
         self.tree.see(rel)
-        self.photo = self.shown = None
+        self.photo = self.shown = self.thumb = self.thumb_t = None
+        if self.full_load:
+            self.root.after_cancel(self.full_load)
+            self.full_load = None
         self.canvas.delete("all")
         self.canvas.create_text(20, 20, anchor="nw", fill="#bbbbbb", text="Loading preview…")
         key = (rel, self.frame_time.get(rel))
@@ -704,7 +877,109 @@ class App:
         for step in (1, 2, 3):  # warm up the next few so flipping through is instant
             nxt = self.rels[(self.index + step) % len(self.rels)]
             self._request(nxt, self.frame_time.get(nxt))
+        self._thumbs_for(rel)
+        self._draw_strip(force=True)
         self._update_labels()
+
+    # -- fast scrubbing ------------------------------------------------------
+
+    def _thumbs_for(self, rel):
+        """The Thumbs of rel, starting it if needed; only the current and next video's are kept."""
+        if rel not in self.thumbs:
+            self.thumbs[rel] = Thumbs(self.state.src(rel))
+        keep = {self.current(), self.rels[(self.index + 1) % len(self.rels)], rel}
+        for r in [r for r in self.thumbs if r not in keep]:
+            self.thumbs.pop(r).cancel()
+        return self.thumbs[rel]
+
+    def _scrub(self, t, from_slider=False):
+        """Show the nearest small frame to t straight away; the full frame follows once you pause."""
+        rel = self.current()
+        if not (rel and self.photo):
+            return
+        th = self.thumbs.get(rel)
+        hit = th.nearest(t) if th else None
+        self.waiting = None  # a full frame still on its way is out of date now
+        if hit:
+            self.thumb_t, frame = hit
+            self.thumb = self.tk.PhotoImage(data=frame, format="PPM")
+            self._render()
+        else:
+            self.thumb_t = t
+        if not from_slider:
+            self.time_var.set(self.thumb_t)
+        self.time_label.config(text=fmt_time(self.thumb_t))
+        self._draw_strip_marker()
+        self._load_full_soon(400 if not from_slider else None)
+
+    def _load_full_soon(self, delay):
+        """Load the full-resolution frame at the scrub position after delay ms (None: wait for release)."""
+        if self.full_load:
+            self.root.after_cancel(self.full_load)
+            self.full_load = None
+        if delay is not None:
+            self.full_load = self.root.after(delay, self._load_full)
+
+    def _load_full(self):
+        self.full_load = None
+        rel = self.current()
+        if rel and self.photo and self.thumb_t is not None:
+            t = round(self.thumb_t, 3)
+            self.frame_time[rel] = t
+            self.waiting = ((rel, t), self._request(rel, t))
+
+    def _step(self, direction):
+        rel = self.current()
+        th = self.thumbs.get(rel)
+        if not (th and self.photo):
+            return
+        now = self.thumb_t if self.thumb_t is not None else self.time_var.get()
+        t = th.step(now, direction)
+        if t is not None:
+            self._scrub(t)
+
+    def _strip_seek(self, e):
+        th = self.thumbs.get(self.current())
+        x0, x1 = self.strip_span
+        if th and th.duration > 0 and x1 > x0:
+            self._scrub(min(max((e.x - x0) / (x1 - x0), 0), 1) * th.duration)
+            self._load_full_soon(None)  # wait for the button release
+
+    def _draw_strip(self, force=False):
+        """Tiles across the filmstrip, each the frame nearest the middle of its slice of the video."""
+        th = self.thumbs.get(self.current())
+        key = (self.current(), th.version if th else None, self.strip.winfo_width())
+        if key == self.strip_key and not force:
+            return
+        self.strip_key = key
+        self.strip.delete("all")
+        self.strip_imgs = []
+        if not th or not th.times or th.duration <= 0:
+            self.strip.create_text(8, 27, anchor="w", fill="#888888",
+                                   text="Building the filmstrip…" if not (th and th.done) else "No filmstrip for this video")
+            return
+        first = self.tk.PhotoImage(data=th.frames[0], format="PPM")
+        k = max(1, round(first.height() / 50))
+        tile_w = max(1, first.width() // k)
+        width = max(self.strip.winfo_width(), 100)
+        n = max(1, width // tile_w)
+        x0 = (width - n * tile_w) // 2
+        self.strip_span = (x0, x0 + n * tile_w)
+        for i in range(n):
+            hit = th.nearest((i + 0.5) / n * th.duration)
+            img = self.tk.PhotoImage(data=hit[1], format="PPM").subsample(k)
+            self.strip_imgs.append(img)
+            self.strip.create_image(x0 + i * tile_w, 2, image=img, anchor="nw")
+        self._draw_strip_marker()
+
+    def _draw_strip_marker(self):
+        self.strip.delete("marker")
+        th = self.thumbs.get(self.current())
+        x0, x1 = self.strip_span
+        if th and th.duration > 0:
+            t = self.thumb_t if self.thumb_t is not None else self.time_var.get()
+            x = x0 + (x1 - x0) * min(max(t / th.duration, 0), 1)
+            self.strip.create_line(x, 0, x, 54, fill="#ffd400", width=3, tags="marker")
 
     def next(self):
         if self.rels:
@@ -735,12 +1010,12 @@ class App:
         rel = self.current()
         if not rel:
             return
-        if not (self.rect and self.photo):
-            self.flash("Draw a crop box first (drag on the frame), or press U to copy this video uncropped.")
+        if not ((self.rect or self.masks) and self.photo):
+            self.flash("Draw a crop box or a black-out box first, or press U to copy this video unchanged.")
             return
-        crop = self._crop_values()
-        self.state.decide(rel, "crop", crop)
-        self.last_crop = crop
+        crop, masks = self._edit_values()
+        self.state.decide(rel, "crop", crop, masks)
+        self.last_edit = (crop, masks)
         self._advance()
 
     def copy_as_is(self):
@@ -749,19 +1024,85 @@ class App:
             self._advance()
 
     def clear(self):
-        self.rect = None
+        """Remove the boxes of the current drawing tool."""
+        if self.tool.get() == "crop":
+            self.rect = None
+        else:
+            self.masks = []
+        self._draw_rect()
+
+    def switch_tool(self):
+        self.tool.set("mask" if self.tool.get() == "crop" else "crop")
         self._draw_rect()
 
     def reuse(self):
-        if not (self.last_crop and self.photo):
-            self.flash("No previous crop to reuse yet.")
+        if not (self.last_edit and self.photo):
+            self.flash("No previous boxes to reuse yet.")
             return
-        x, y, w, h = self.last_crop
+        self._apply_last()
+        self._draw_rect()
+
+    def _fit(self, box):
+        """An [x, y, w, h] box moved/shrunk to fit this frame, as corners."""
+        x, y, w, h = box
         W, H = self.src_size
         w, h = min(w, W), min(h, H)
         x, y = min(x, W - w), min(y, H - h)
-        self.rect = [x, y, x + w, y + h]
-        self._draw_rect()
+        return [x, y, x + w, y + h]
+
+    def _apply_last(self):
+        crop, masks = self.last_edit
+        self.rect = self._fit(crop) if crop else None
+        self.masks = [self._fit(m) for m in masks]
+
+    def apply_all(self):
+        """Save the current boxes on this video and every undecided video with the same frame size."""
+        from tkinter import messagebox
+        rel = self.current()
+        if not ((self.rect or self.masks) and self.photo):
+            self.flash("Draw a crop box or a black-out box first, then apply it to all remaining videos.")
+            return
+        if self.applying is not None:
+            return
+        targets = [r for r in self.rels if r == rel or self.state.videos[r]["action"] is None]
+        if not messagebox.askyesno(
+                "Bulk Crop", f"Apply these boxes to this video and the {len(targets) - 1} other videos "
+                             "that don't have a decision yet?\n\nVideos with a different frame size are "
+                             "skipped and left for you to do."):
+            return
+        crop, masks = self._edit_values()
+        self.applying = "running"
+        self.flash_text, self.flash_until = f"Checking frame sizes of {len(targets)} videos…", time.time() + 3600
+        self._refresh()
+
+        def frame_size(r):
+            info = probe(self.state.src(r))
+            return info["width"], info["height"]
+
+        def work():
+            same = []
+            try:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    sizes = list(ex.map(frame_size, targets))
+                size = sizes[targets.index(rel)]
+                same = [r for r, s in zip(targets, sizes) if s == size and s[0]]
+                for r in same:
+                    if r == rel or self.state.videos[r]["action"] is None:  # may have changed meanwhile
+                        self.state.decide(r, "crop", crop, masks)
+            except Exception as e:
+                log.info("apply to all failed: %s", e)
+            finally:
+                self.applying = (len(same), len(targets) - len(same), crop, masks)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _applied(self):
+        done, skipped, crop, masks = self.applying
+        self.applying = None
+        self.last_edit = (crop, masks)
+        self.flash_until = 0
+        self._advance()
+        self.flash(f"Applied to {done} videos." +
+                   (f"  {skipped} skipped (different frame size) and still need you." if skipped else ""))
 
     def retry_failed(self):
         self.state.retry_failed()
@@ -778,9 +1119,9 @@ class App:
         duration = probe(src)["duration"]
         if t is None:
             t = min(5.0, duration * 0.1)
-        png = os.path.join(self.cache_dir, f"{next(self.png_ids)}.png")
-        extract_frame(src, t, png)
-        return rel, t, duration, png
+        img = os.path.join(self.cache_dir, f"{next(self.img_ids)}.ppm")
+        extract_frame(src, t, img)
+        return rel, t, duration, img
 
     def _request(self, rel, t):
         key = (rel, t)
@@ -789,17 +1130,13 @@ class App:
         return self.futures[key]
 
     def _time_released(self, _=None):
-        rel = self.current()
-        if not rel or not self.photo:
-            return
-        t = round(self.time_var.get(), 1)
-        if t != self.frame_time.get(rel):
-            self.frame_time[rel] = t
-            self.waiting = ((rel, t), self._request(rel, t))
+        if self.thumb_t is None:
+            self.thumb_t = self.time_var.get()
+        self._load_full_soon(0)
 
     def _display(self, key, fut):
         try:
-            rel, t, duration, png = fut.result()
+            rel, t, duration, img = fut.result()
         except Exception as e:
             self.futures.pop(key, None)  # allow a retry next time
             if key[0] == self.current():
@@ -814,18 +1151,39 @@ class App:
         self.time_scale.configure(to=max(duration, 0.1))
         self.time_var.set(t)
         self.time_label.config(text=fmt_time(t))
-        self.photo = self.tk.PhotoImage(file=png)
+        self.photo = self.tk.PhotoImage(file=img)
+        self.futures.pop(key, None)  # the file goes now (big, uncompressed); coming back re-extracts it
+        try:
+            os.remove(img)
+        except OSError:
+            pass
         self.src_size = (self.photo.width(), self.photo.height())
+        self.thumb, self.thumb_t = None, t
+        if self.carry:  # undecided video: start from the last saved boxes, so Enter accepts them
+            self.carry = False
+            self._apply_last()
         self._render()
+        self._draw_strip_marker()
 
     def _render(self):
+        """Show the full frame (shrunk to fit), or while scrubbing the small frame blown up to about the
+        same size. Either way self.scale maps screen to source pixels, so boxes stay put."""
         if not self.photo:
             return
         self.canvas.delete("all")
         cw, ch = max(self.canvas.winfo_width(), 50), max(self.canvas.winfo_height(), 50)
         W, H = self.src_size
-        self.sub = max(1, math.ceil(max(W / cw, H / ch)))
-        self.shown = self.photo.subsample(self.sub) if self.sub > 1 else self.photo
+        fit = min(cw / W, ch / H, 1.0)  # how big the full frame can be shown
+        img = self.thumb or self.photo
+        # Tk only scales by whole-number zoom/subsample, so pick the fraction closest below the fit
+        p, q = max(((p, q) for p in range(1, 9) for q in range(1, 9)
+                    if p / q <= fit * W / img.width()), key=lambda pq: pq[0] / pq[1], default=(1, 8))
+        if (p, q) == (1, 1):
+            self.shown = img
+        else:
+            self.shown = self.tk.PhotoImage()
+            self.shown.tk.call(self.shown, "copy", img, "-zoom", p, p, "-subsample", q, q)
+        self.scale = (W / self.shown.width(), H / self.shown.height())
         self.origin = ((cw - self.shown.width()) // 2, (ch - self.shown.height()) // 2)
         self.canvas.create_image(*self.origin, image=self.shown, anchor="nw")
         self._draw_rect()
@@ -833,16 +1191,21 @@ class App:
     # -- drawing the crop box ------------------------------------------------
 
     def _to_src(self, ex, ey):
-        (ox, oy), (W, H) = self.origin, self.src_size
-        return min(max((ex - ox) * self.sub, 0), W), min(max((ey - oy) * self.sub, 0), H)
+        (ox, oy), (W, H), (kx, ky) = self.origin, self.src_size, self.scale
+        return min(max((ex - ox) * kx, 0), W), min(max((ey - oy) * ky, 0), H)
 
     def _to_canvas(self, sx, sy):
-        ox, oy = self.origin
-        return ox + sx / self.sub, oy + sy / self.sub
+        (ox, oy), (kx, ky) = self.origin, self.scale
+        return ox + sx / kx, oy + sy / ky
 
     @staticmethod
     def _norm(r):
         return [min(r[0], r[2]), min(r[1], r[3]), max(r[0], r[2]), max(r[1], r[3])]
+
+    @staticmethod
+    def _corners(box):
+        x, y, w, h = box
+        return [x, y, x + w, y + h]
 
     def _crop_values(self):
         """The box as ffmpeg crop values, snapped to even numbers (needed for 4:2:0 video)."""
@@ -853,11 +1216,44 @@ class App:
         h = min(int(y1 - y), H - y) // 2 * 2
         return [x, y, max(w, 2), max(h, 2)]
 
+    def _mask_values(self, r):
+        """A black-out box as [x, y, w, h], grown outward to even numbers so nothing at its edge survives."""
+        x0, y0, x1, y1 = self._norm(r)
+        W, H = self.src_size
+        x, y = int(x0) // 2 * 2, int(y0) // 2 * 2
+        x1, y1 = min(math.ceil(x1 / 2) * 2, W), min(math.ceil(y1 / 2) * 2, H)
+        return [x, y, x1 - x, y1 - y]
+
+    def _edit_values(self):
+        crop = self._crop_values() if self.rect else None
+        return crop, [self._mask_values(m) for m in self.masks]
+
+    def _box(self, target):
+        return self.rect if target == "crop" else self.masks[target]
+
+    def _set_box(self, target, r):
+        if target == "crop":
+            self.rect = r
+        else:
+            self.masks[target] = r
+
     def _hit(self, ex, ey):
-        """Edges of the box under the pointer ("l", "r", "t", "b" combos), "move", or None."""
-        if not (self.rect and self.photo):
+        """(box, edges) under the pointer, for boxes of the current tool: box is "crop" or a mask
+        index, edges a combo of "l", "r", "t", "b", or "move". None if over no box."""
+        if not self.photo:
             return None
-        x0, y0, x1, y1 = self._norm(self.rect)
+        if self.tool.get() == "crop":
+            candidates = ["crop"] if self.rect else []
+        else:
+            candidates = list(reversed(range(len(self.masks))))  # topmost (latest) first
+        for target in candidates:
+            edges = self._edges(self._box(target), ex, ey)
+            if edges:
+                return target, edges
+        return None
+
+    def _edges(self, r, ex, ey):
+        x0, y0, x1, y1 = self._norm(r)
         (cx0, cy0), (cx1, cy1) = self._to_canvas(x0, y0), self._to_canvas(x1, y1)
         tol = 8
         if not (cx0 - tol <= ex <= cx1 + tol and cy0 - tol <= ey <= cy1 + tol):
@@ -876,7 +1272,7 @@ class App:
     def _hover(self, e):
         hit = self._hit(e.x, e.y)
         cursor = {None: "crosshair", "move": "fleur", "l": "sb_h_double_arrow", "r": "sb_h_double_arrow",
-                  "t": "sb_v_double_arrow", "b": "sb_v_double_arrow"}.get(hit, "sizing")
+                  "t": "sb_v_double_arrow", "b": "sb_v_double_arrow"}.get(hit and hit[1], "sizing")
         self.canvas.config(cursor=cursor)
 
     def _press(self, e):
@@ -884,22 +1280,26 @@ class App:
             return
         hit = self._hit(e.x, e.y)
         sx, sy = self._to_src(e.x, e.y)
-        if hit is None:
-            self.rect, hit = [sx, sy, sx, sy], "rb"
+        if hit is None:  # start a new box
+            if self.tool.get() == "crop":
+                self.rect, hit = [sx, sy, sx, sy], ("crop", "rb")
+            else:
+                self.masks.append([sx, sy, sx, sy])
+                hit = (len(self.masks) - 1, "rb")
         else:
-            self.rect = self._norm(self.rect)
-        self.drag = (hit, sx, sy, list(self.rect))
+            self._set_box(hit[0], self._norm(self._box(hit[0])))
+        self.drag = (*hit, sx, sy, list(self._box(hit[0])))
 
     def _drag(self, e):
         if not self.drag:
             return
-        hit, sx0, sy0, orig = self.drag
+        target, hit, sx0, sy0, orig = self.drag
         sx, sy = self._to_src(e.x, e.y)
         if hit == "move":
             (W, H), w, h = self.src_size, orig[2] - orig[0], orig[3] - orig[1]
             nx = min(max(orig[0] + sx - sx0, 0), W - w)
             ny = min(max(orig[1] + sy - sy0, 0), H - h)
-            self.rect = [nx, ny, nx + w, ny + h]
+            self._set_box(target, [nx, ny, nx + w, ny + h])
         else:
             r = list(orig)
             if "l" in hit:
@@ -910,30 +1310,60 @@ class App:
                 r[1] = sy
             if "b" in hit:
                 r[3] = sy
-            self.rect = r
+            self._set_box(target, r)
         self._draw_rect()
 
     def _release(self, _):
         if not self.drag:
             return
-        self.drag = None
-        x0, y0, x1, y1 = self._norm(self.rect)
-        self.rect = None if (x1 - x0 < 8 or y1 - y0 < 8) else [x0, y0, x1, y1]
+        target, self.drag = self.drag[0], None
+        x0, y0, x1, y1 = self._norm(self._box(target))
+        if x1 - x0 < 8 or y1 - y0 < 8:  # just a click: drop the box
+            self._remove_box(target)
+        else:
+            self._set_box(target, [x0, y0, x1, y1])
         self._draw_rect()
+
+    def _remove_box(self, target):
+        if target == "crop":
+            self.rect = None
+        else:
+            del self.masks[target]
+
+    def _delete_box(self, e):
+        hit = self._hit(e.x, e.y)
+        if hit and not self.drag:
+            self._remove_box(hit[0])
+            self._draw_rect()
 
     def _draw_rect(self):
         self.canvas.delete("crop")
-        if self.rect and self.photo:
-            x0, y0, x1, y1 = self._norm(self.rect)
-            (cx0, cy0), (cx1, cy1) = self._to_canvas(x0, y0), self._to_canvas(x1, y1)
+        if self.photo:
             ix0, iy0 = self.origin
             ix1, iy1 = ix0 + self.shown.width(), iy0 + self.shown.height()
-            shade = dict(fill="black", stipple="gray50", outline="", tags="crop")
-            for box in ((ix0, iy0, ix1, cy0), (ix0, cy1, ix1, iy1), (ix0, cy0, cx0, cy1), (cx1, cy0, ix1, cy1)):
-                self.canvas.create_rectangle(*box, **shade)
-            self.canvas.create_rectangle(cx0, cy0, cx1, cy1, outline="#ffd400", width=2, tags="crop")
-            for hx, hy in ((cx0, cy0), (cx1, cy0), (cx0, cy1), (cx1, cy1)):
-                self.canvas.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, fill="#ffd400", outline="", tags="crop")
+            editing = self.tool.get()
+
+            def handles(cx0, cy0, cx1, cy1, color):
+                for hx, hy in ((cx0, cy0), (cx1, cy0), (cx0, cy1), (cx1, cy1)):
+                    self.canvas.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, fill=color, outline="", tags="crop")
+
+            for m in self.masks:  # solid black, as they'll come out in the video
+                x0, y0, x1, y1 = self._norm(m)
+                (cx0, cy0), (cx1, cy1) = self._to_canvas(x0, y0), self._to_canvas(x1, y1)
+                self.canvas.create_rectangle(cx0, cy0, cx1, cy1, fill="black", outline="#ff4040",
+                                             width=2 if editing == "mask" else 1, tags="crop")
+                if editing == "mask":
+                    handles(cx0, cy0, cx1, cy1, "#ff4040")
+            if self.rect:
+                x0, y0, x1, y1 = self._norm(self.rect)
+                (cx0, cy0), (cx1, cy1) = self._to_canvas(x0, y0), self._to_canvas(x1, y1)
+                shade = dict(fill="black", stipple="gray50", outline="", tags="crop")
+                for box in ((ix0, iy0, ix1, cy0), (ix0, cy1, ix1, iy1), (ix0, cy0, cx0, cy1), (cx1, cy0, ix1, cy1)):
+                    self.canvas.create_rectangle(*box, **shade)
+                self.canvas.create_rectangle(cx0, cy0, cx1, cy1, outline="#ffd400",
+                                             width=2 if editing == "crop" else 1, tags="crop")
+                if editing == "crop":
+                    handles(cx0, cy0, cx1, cy1, "#ffd400")
         self._update_labels()
 
     # -- status --------------------------------------------------------------
@@ -945,16 +1375,16 @@ class App:
         job = self.state.videos[rel]
         size = f"     ({self.src_size[0]}×{self.src_size[1]})" if self.photo else ""
         self.info.config(text=f"{self.index + 1} / {len(self.rels)}     {rel}{size}")
-        if self.rect and self.photo:
-            x, y, w, h = self._crop_values()
-            text = f"Crop box: {w}×{h} at x={x}, y={y}"
-        else:
+        if (self.rect or self.masks) and self.photo:
+            text = "Now: " + describe_edit(*self._edit_values())
+        elif self.tool.get() == "crop":
             text = "Drag on the frame to draw a crop box. Drag inside it to move it, drag its edges to resize."
+        else:
+            text = "Drag on the frame to draw a black-out box. Drag inside one to move it, drag its edges to resize."
         if job["action"] == "crop":
-            x, y, w, h = job["crop"]
-            text += f"          Saved: {w}×{h} at ({x}, {y})"
+            text += "          Saved: " + describe_edit(job["crop"], job.get("masks") or [])
         elif job["action"] == "copy":
-            text += "          Saved: copy uncropped"
+            text += "          Saved: copy unchanged"
         if job["status"] == "failed":
             text += f"          ERROR: {job['error']}"
         self.crop_label.config(text=text)
@@ -964,11 +1394,11 @@ class App:
             if job["action"] == "copy":
                 return "copying…", "running"
             p = self.state.progress.get(rel)
-            return (f"cropping {p:.0%}" if p is not None else "cropping…"), "running"
+            return (f"encoding {p:.0%}" if p is not None else "encoding…"), "running"
         copy = job["action"] == "copy"
-        return {"todo": ("needs crop", "todo"),
+        return {"todo": ("to do", "todo"),
                 "queued": ("copy queued" if copy else "queued", "queued"),
-                "done": ("copied ✓" if copy else "cropped ✓", "done"),
+                "done": ("copied ✓" if copy else "done ✓", "done"),
                 "failed": ("failed ✗", "failed")}[job["status"]]
 
     def _refresh(self):
@@ -982,7 +1412,7 @@ class App:
             self.status.config(text=self.flash_text)
             return
         c = self.state.counts()
-        text = (f"Videos:  {c['todo']} need a crop  ·  {c['queued']} waiting  ·  {c['running']} encoding  ·  "
+        text = (f"Videos:  {c['todo']} to do  ·  {c['queued']} waiting  ·  {c['running']} encoding  ·  "
                 f"{c['done']} done  ·  {c['failed']} failed          "
                 f"Other files copied: {c['files_done']}/{c['files_total']}")
         if c["files_failed"]:
@@ -1001,9 +1431,16 @@ class App:
         if self.waiting and self.waiting[1].done():
             (key, fut), self.waiting = self.waiting, None
             self._display(key, fut)
+        if isinstance(self.applying, tuple):
+            self._applied()
         self.ticks += 1
         if self.ticks % 5 == 0:
             self._refresh()
+            if self.rels:
+                self._draw_strip()  # only redraws when new frames have arrived
+                th = self.thumbs.get(self.current())
+                if th and th.done and len(self.rels) > 1:  # get the next video's filmstrip ready too
+                    self._thumbs_for(self.rels[(self.index + 1) % len(self.rels)])
             if self.rels and self.state.videos[self.current()]["status"] == "failed":
                 self._update_labels()
         self.root.after(100, self.tick)
@@ -1032,6 +1469,8 @@ class App:
             pass
         if busy and background:
             launch_background(self.state)
+        for th in self.thumbs.values():
+            th.cancel()
         self.previews.shutdown(wait=False, cancel_futures=True)
         shutil.rmtree(self.cache_dir, ignore_errors=True)
         self.root.destroy()
